@@ -3,12 +3,15 @@
 
 #USER_SIMPLSHARP_LIBRARY "QscQsys"
 
-analog_input SetIntegerValue;
+#DEFINE_CONSTANT true 1
+#DEFINE_CONSTANT false 0
 
-analog_Output IntegerValue;
+analog_input SetUnsignedIntegerValue, SetSignedIntegerValue;
 
-string_parameter  _skip_, CoreID[100], NamedControlName[100];
-integer_parameter Scaled;
+analog_Output IntegerValueScaled, IntegerValueUnscaled;
+
+string_parameter  _skip_, _skip_, CoreID[100], NamedControlName[100];
+integer_parameter ScaleUnsigned;
 
 #BEGIN_PARAMETER_PROPERTIES CoreID
    propValidUnits = unitString;
@@ -16,7 +19,7 @@ integer_parameter Scaled;
    propDefaultValue = "1";
 #END_PARAMETER_PROPERTIES
 
-#BEGIN_PARAMETER_PROPERTIES Scaled
+#BEGIN_PARAMETER_PROPERTIES ScaleUnsigned
    propValidUnits = unitDecimal;
    propDefaultUnit = unitDecimal;
    propDefaultValue = 0d;
@@ -24,35 +27,66 @@ integer_parameter Scaled;
 
 #END_PARAMETER_PROPERTIES
 
-
-
 QsysNamedControl integerControl;
+signed_long_integer intVal;
+integer changeSemephore;
 
-threadsafe change SetIntegerValue
+threadsafe change SetUnsignedIntegerValue
 {
-    Integer x;
+    integer x;
+	
+	if(SetUnsignedIntegerValue = 0)
+	{
+		integerControl.SetUnsignedInteger(0, ScaleUnsigned);
+	}
+	else 
+	{
+		While(x != SetUnsignedIntegerValue)
+		{
+			x = SetUnsignedIntegerValue;
+			integerControl.SetUnsignedInteger(x, ScaleUnsigned);
+		}
+	}
+}
 
-    if(SetIntegerValue = 0)
+change SetSignedIntegerValue
+{
+    signed_long_integer x;
+    intVal = SetSignedIntegerValue;
+
+    if(changeSemephore)
     {
-        integerControl.SetInteger(0, Scaled);
-    }
-    else
-    {
-        while(x != SetIntegerValue)
+        changeSemephore = false;
+        if(intVal = 0)
         {
-            x = SetIntegerValue;
-            integerControl.SetInteger(x, Scaled);
+            x = intVal;
+            integerControl.SetSignedInteger(x, 0);
         }
+        while(x != intVal)
+        {
+            x = intVal;
+            integerControl.SetSignedInteger(x, 0);
+        }
+
+        changeSemephore = true;
     }
 }
 
-callback function NewIntegerChange(string cName, integer value, string x)
+callback function NewUIntChange(string cName, integer value)
 {
-    IntegerValue = value;
+    IntegerValueScaled = value;
+}
+
+callback function NewIntChange(string cName, signed_integer value)
+{
+    IntegerValueUnscaled = value;
 }
 
 function Main()
 {
-    RegisterDelegate(integerControl, newNamedControlChange, NewIntegerChange);
+    RegisterDelegate(integerControl, newNamedControlUIntChange, NewUIntChange);
+    RegisterDelegate(integerControl, newNamedControlIntChange, NewIntChange);
     integerControl.Initialize(CoreID, NamedControlName, 1);
+
+    changeSemephore = true;
 }

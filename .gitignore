@@ -23,6 +23,7 @@ Log/
 *.vtz
 *.hash
 *.dip
+*.projectinfo
 
 # we are choosing to ignore CEDs and SGDs, as they will be regenerated when the touchpanel is recompiled
 *.ced
@@ -57,7 +58,7 @@ Archive/
 *.sln.docstates
 
 # Build results
-[Dd]ebug/
+#[Dd]ebug/
 [Dd]ebugPublic/
 [Rr]elease/
 [Rr]eleases/
@@ -65,7 +66,7 @@ x64/
 x86/
 build/
 bld/
-[Bb]in/
+#[Bb]in/
 [Oo]bj/
 
 # Roslyn cache directories

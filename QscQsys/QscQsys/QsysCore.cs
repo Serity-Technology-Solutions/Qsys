@@ -6,589 +6,983 @@ using Crestron.SimplSharp;             				// For Basic SIMPL# Classes
 using ExtensionMethods;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
+using QscQsys.Intermediaries;
 using TCP_Client;
 
 namespace QscQsys
 {
     /// <summary>
-    /// Q-SYS Core class that manages connection and parses responses to be dsitributed to components and named control classes
+    /// Q-SYS Core class that manages connection and parses responses to be distributed to components and named control classes.
     /// </summary>
     public class QsysCore : IDisposable
     {
+
+        public const double TOLERANCE = .1d;
+
         #region Delegates
+
         public delegate void IsLoggedIn(SimplSharpString id, ushort value);
+
         public delegate void IsRegistered(SimplSharpString id, ushort value);
-        public delegate void IsConnectedStatus(SimplSharpString id, ushort value);
-        public delegate void CoreStatus(SimplSharpString id, SimplSharpString designName, ushort isRedundant, ushort isEmulator);
+
+        public delegate void PrimaryIsConnectedStatus(SimplSharpString id, ushort value);
+
+        public delegate void BackupIsConnectedStatus(SimplSharpString id, ushort value);
+
+        public delegate void CoreStatus(
+            SimplSharpString id, SimplSharpString designName, ushort isRedundant, ushort isEmulator);
+
+        public delegate void PrimaryIsActive();
+
+        public delegate void BackupIsActive();
+
         public delegate void SendingCommand(SimplSharpString id, SimplSharpString command);
-        public IsLoggedIn onIsLoggedIn { get; set; }
-        public IsRegistered onIsRegistered { get; set; }
-        public IsConnectedStatus onIsConnected { get; set; }
-        public CoreStatus onNewCoreStatus { get; set; }
-        public SendingCommand onSendingCommand { get; set; }
+
+        public IsLoggedIn OnIsLoggedIn { get; set; }
+        public IsRegistered OnIsRegistered { get; set; }
+        public PrimaryIsConnectedStatus OnPrimaryIsConnected { get; set; }
+        public BackupIsConnectedStatus OnBackupIsConnected { get; set; }
+        public CoreStatus OnNewCoreStatus { get; set; }
+        public PrimaryIsActive OnPrimaryIsActive { get; set; }
+        public BackupIsActive OnBackupIsActive { get; set; }
+        public SendingCommand OnSendingCommand { get; set; }
+
         #endregion
 
-        private readonly CrestronQueue<string> commandQueue = new CrestronQueue<string>(1000);
-        //private readonly CrestronQueue<string> responseQueue = new CrestronQueue<string>(100);
-        private CTimer commandQueueTimer;
-        //private CTimer responseQueueTimer;
-        private CTimer heartbeatTimer;
-        private CTimer waitForConnection;
-        private TCPClientDevice client;
-        private StringBuilder RxData = new StringBuilder();
-        private readonly object responseLock = new object();
-        private readonly object parseLock = new object();
-        private bool isInitialized;
-        private bool isLoggedIn;
-        private bool isDisposed;
-        private ushort debug;
-        private ushort logonAttempts;
-        private ushort maxLogonAttempts = 2;
-        private bool isRedundant;
-        private bool isEmulator;
-        private bool externalConnection;
-        private bool changeGroupCreated;
+        private readonly CrestronQueue<string> _commandQueue = new CrestronQueue<string>(1000);
+        private readonly CTimer _commandQueueTimer;
+        private readonly CTimer _heartbeatTimer;
+        private readonly CTimer _waitForConnection;
+        private TCPClientDevice _primaryClient;
+        private TCPClientDevice _backupClient;
+        private StringBuilder _primaryRxData = new StringBuilder();
+        private StringBuilder _backupRxData = new StringBuilder();
+        private readonly object _primaryResponseLock = new object();
+        private readonly object _backupResponseLock = new object();
+        private readonly object _primaryParseLock = new object();
+        private readonly object _backupParseLock = new object();
+        private readonly object _initLock = new object();
 
-        private string designName;
-        private string coreId;
-        private string username;
-        private string password;
+        private readonly CCriticalSection _connectionCritical = new CCriticalSection();
+        private bool _isInitialized;
+        private bool _primaryIsConnected;
+        private bool _backupIsConnected;
+        private bool _isLoggedIn;
+        private bool _disposed;
+        private ushort _debug;
+        private ushort _logonAttempts;
+        private ushort _maxLogonAttempts = 2;
+        private bool _isRedundant;
+        private bool _isEmulator;
+        private bool _primaryCoreActive;
+        private bool _backupCoreActive;
+        private bool _externalConnection;
+        private bool _changeGroupCreated;
+        private string _designName;
+        private string _coreId;
+        private string _username;
+        private string _password;
 
-        internal Dictionary<Component, InternalEvents> Components = new Dictionary<Component, InternalEvents>();
-        internal Dictionary<Control, InternalEvents> Controls = new Dictionary<Control, InternalEvents>();
+        private readonly Dictionary<string, NamedComponent> _components;
+        private readonly Dictionary<string, Action<QsysStateData>> _componentUpdateCallbacks;
+        private readonly Dictionary<string, NamedControl> _controls;
+        private readonly Dictionary<string, Action<QsysStateData>> _controlUpdateCallbacks;
 
+        /// <summary>
+        /// Initializes a new instance of the <see cref="QsysCore"/> class.
+        /// </summary>
         public QsysCore()
         {
-            heartbeatTimer = new CTimer(SendHeartbeat, Timeout.Infinite);
-            commandQueueTimer = new CTimer(CommandQueueDequeue, null, 0, 50);
-            //responseQueueTimer = new CTimer(ResponseQueueDequeue, null, 0, 10);
-            waitForConnection = new CTimer(Initialize, Timeout.Infinite);
+            _components = new Dictionary<string, NamedComponent>();
+            _componentUpdateCallbacks = new Dictionary<string, Action<QsysStateData>>();
+            _controls = new Dictionary<string, NamedControl>();
+            _controlUpdateCallbacks = new Dictionary<string, Action<QsysStateData>>();
+            _heartbeatTimer = new CTimer(SendHeartbeat, Timeout.Infinite);
+            _commandQueueTimer = new CTimer(CommandQueueDequeue, null, 0, 50);
+            _waitForConnection = new CTimer(Initialize, Timeout.Infinite);
         }
-
 
         #region Properties
-        /// <summary>
-        /// Get initialzation status
-        /// </summary>
-        public bool IsInitialized { get { return isInitialized; } }
 
         /// <summary>
-        /// Get disposed status
+        /// Gets initialzation status.
         /// </summary>
-        public bool IsDisposed { get { return isDisposed; } }
-
-        /// <summary>
-        /// Get connection status
-        /// </summary>
-        public bool IsConnected { get; private set; }
-
-        /// <summary>
-        /// Get debug mode
-        /// </summary>
-        public ushort IsDebugMode { get { return debug; } }
-
-        /// <summary>
-        /// Get or set  max logon attempts
-        /// </summary>
-        public ushort MaxLogonAttemps { get { return maxLogonAttempts; } set { maxLogonAttempts = value; } }
-
-        internal bool RegisterComponent(Component component)
+        public bool IsInitialized
         {
-            try
-            {
-                lock (Components)
-                {
-                    if (!Components.ContainsKey(component))
-                    {
-                        Components.Add(component, new InternalEvents());
-
-                        if (isInitialized && IsConnected)
-                        {
-                            var addComponent = new AddComoponentToChangeGroup() { method = "ChangeGroup.AddComponentControl", ComponentParams = new AddComponentToChangeGroupParams() { Component = component } };
-                            commandQueue.Enqueue(JsonConvert.SerializeObject(addComponent));
-
-                            StartAutoPoll();
-
-                            if (debug == 2)
-                                CrestronConsole.PrintLine("Registered {0} Component", component.Name);
-                        }
-                    }
-                }
-
-                return true;
-            }
-            catch (Exception e)
-            {
-                if (debug == 1 || debug == 2)
-                    ErrorLog.Error("Error registering QsysClient to the QsysProcessor: {0}", e.Message);
-                return false;
-            }
-        }
-
-        internal bool RegisterControl(Control control)
-        {
-            try
-            {
-                lock (Controls)
-                {
-                    if (!Controls.ContainsKey(control))
-                    {
-                        Controls.Add(control, new InternalEvents());
-
-                        if (isInitialized && IsConnected)
-                        {
-                            var addControl = new AddControlToChangeGroup() { method = "ChangeGroup.AddControl", ControlParams = new AddControlToChangeGroupParams() { Controls = new List<string>() { control.Name } } };
-                            commandQueue.Enqueue(JsonConvert.SerializeObject(addControl));
-
-                            StartAutoPoll();
-
-                            if (debug == 2)
-                                CrestronConsole.PrintLine("Registered {0} Control", control.Name);
-                        }
-                    }
-                }
-
-                return true;
-            }
-            catch (Exception e)
-            {
-                if (debug == 1 || debug == 2)
-                    ErrorLog.Error("Error registering QsysClient to the QsysProcessor: {0}", e.Message);
-                return false;
-            }
+            get { return _isInitialized; }
         }
 
         /// <summary>
-        /// Get redundant status
+        /// Gets disposed status.
         /// </summary>
-        public bool IsRedundant { get { return isRedundant; } }
+        public bool IsDisposed
+        {
+            get { return _disposed; }
+        }
 
         /// <summary>
-        /// Get emulator status
+        /// Gets primary core connection status.
         /// </summary>
-        public bool IsEmulator { get { return isEmulator; } }
+        public bool PrimaryIsConnected
+        {
+            get { return _primaryIsConnected; }
+        }
 
         /// <summary>
-        /// Get running design name
+        /// Gets backup core connection status.
         /// </summary>
-        public string DesignName { get { return designName; } }
+        public bool SecondaryIsConnected
+        {
+            get { return _backupIsConnected; }
+        }
 
         /// <summary>
-        /// Get core ID
+        /// Gets authentication status.
         /// </summary>
-        public string CoreId { get { return coreId; } }
-        #endregion
+        public bool IsAuthenticated
+        {
+            get { return _isLoggedIn; }
+        }
 
         /// <summary>
-        /// Set dbug mode.
+        /// Gets debug mode.
         /// </summary>
-        /// <param name="value"></param>
+        public ushort IsDebugMode
+        {
+            get { return _debug; }
+        }
+
+        /// <summary>
+        /// Gets or sets the max logon attempts made when trying to authorize with the core.
+        /// </summary>
+        public ushort MaxLogonAttemps
+        {
+            get { return _maxLogonAttempts; }
+            set { _maxLogonAttempts = value; }
+        }
+
+        /// <summary>
+        /// Gets redundant status.
+        /// </summary>
+        public bool IsRedundant
+        {
+            get { return _isRedundant; }
+        }
+
+        /// <summary>
+        /// Gets emulator status.
+        /// </summary>
+        public bool IsEmulator
+        {
+            get { return _isEmulator; }
+        }
+
+        /// <summary>
+        /// Gets running design name.
+        /// </summary>
+        public string DesignName
+        {
+            get { return _designName; }
+        }
+
+        /// <summary>
+        /// Gets a bool representing the primary core active status.
+        /// </summary>
+        public bool PrimaryCoreActive
+        {
+            get { return _primaryCoreActive; }
+        }
+
+        /// <summary>
+        /// Gets a bool representing the backup core active status.
+        /// </summary>
+        public bool BackupCoreActive
+        {
+            get { return _backupCoreActive; }
+        }
+
+        /// <summary>
+        /// Get the core ID.
+        /// </summary>
+        public string CoreId
+        {
+            get { return _coreId; }
+        }
+
+        /// <summary>
+        /// Set debug mode.
+        /// </summary>
+        /// <param name="value">Debug level to set.</param>
+        /// <remarks>
+        /// Debug level 0 = off
+        /// Debug level 1 = Main communications
+        /// Debug level 2 = Main communications and verbose console
+        /// </remarks>
         public void Debug(ushort value)
         {
-            debug = value;
+            _debug = value;
 
-            if (debug > 0)
+            if (_primaryClient != null)
             {
-                CrestronConsole.PrintLine("********Qsys Debug Mode Active********");
-                CrestronConsole.PrintLine("See log for details");
-                ErrorLog.Notice("********Qsys Debug Mode Active********");
-                if (debug == 1)
-                {
+                _primaryClient.Debug = _debug;
+            }
+
+            if (_backupClient != null)
+            {
+                _backupClient.Debug = _debug;
+            }
+
+            if (_debug <= 0) return;
+            CrestronConsole.PrintLine("********Qsys Debug Mode Active********");
+            CrestronConsole.PrintLine("See log for details");
+            ErrorLog.Notice("********Qsys Debug Mode Active********");
+            if (QsysCoreManager.Is3Series)
+            {
+                CrestronConsole.PrintLine("********Qsys Running On 3-Series********");
+                ErrorLog.Notice("********Qsys Running On 3-Series********");
+            }
+            else
+            {
+                CrestronConsole.PrintLine("********Qsys Running On 4-Series Or Greater********");
+                ErrorLog.Notice("********Qsys Running On 4-Series Or Greater********");
+            }
+
+            switch (_debug)
+            {
+                case 1:
                     ErrorLog.Notice("Qsys debug level: Main communications");
-                }
-                else if (debug == 2)
-                {
+                    break;
+                case 2:
                     ErrorLog.Notice("Qsys debug level: Main communications and verbose console");
+                    break;
+            }
+            ErrorLog.Notice("Qsys TCP ID 1710");
+        }
+
+        /// <summary>
+        /// Get or set the network port. If currently connected, changing the port will reconnect with the new port number.
+        /// </summary>
+        public ushort Port
+        {
+            get { return _primaryClient == null ? ushort.MinValue : _primaryClient.Port; }
+            set
+            {
+                if (_primaryClient != null)
+                {
+                    _primaryClient.Port = value;
                 }
-                ErrorLog.Notice("Qsys TCP ID 1710");
+
+                if (_backupClient != null)
+                {
+                    _backupClient.Port = value;
+                }
             }
         }
+
+        /// <summary>
+        /// Gets or sets the primary core network host address. If currently connected, changing the host will reconnect with the new host address.
+        /// </summary>
+        public string PrimaryHost
+        {
+            get { return _primaryClient == null ? string.Empty : _primaryClient.Host; }
+            set
+            {
+                if (_primaryClient != null)
+                {
+                    _primaryClient.Host = value;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Gets or sets the backup core network host address. If currently connected, changing the host will reconnect with the new host address.
+        /// </summary>
+        public string BackupHost
+        {
+            get { return _backupClient == null ? string.Empty : _backupClient.Host; }
+            set
+            {
+                if (_backupClient == null) return;
+                if (_backupClient.Host == string.Empty)
+                {
+                    _backupClient.Host = value;
+                    _backupClient.Connect();
+                    return;
+                }
+
+                _backupClient.Host = value;
+            }
+        }
+
+        /// <summary>
+        /// Gets or sets the username used to authenticate with the core.
+        /// </summary>
+        public string Username
+        {
+            get { return _username; }
+            set { _username = value; }
+        }
+
+        /// <summary>
+        /// Sets the password used to authenticate with the core.
+        /// </summary>
+        public string Password
+        {
+            set { _password = value; }
+        }
+
+    #endregion
 
         #region Initialization
         /// <summary>
         /// Initialzes all methods that are required to setup the class. Connection is established on port 1702.
         /// </summary>
-        public void Initialize(string id, string host, ushort port, string username, string password, ushort useExternalConnection)
+        public void Initialize(string id, string primaryHost, string backupHost, ushort port, string username, string password, ushort useExternalConnection)
         {
-            if (!isInitialized)
+            lock (_initLock)
             {
+                if (_isInitialized)
+                    return;
+
                 try
                 {
-                    coreId = id;
+                    _coreId = id;
 
-                    externalConnection = Convert.ToBoolean(useExternalConnection);
+                    _externalConnection = Convert.ToBoolean(useExternalConnection);
 
-                    if (username.Length > 0)
-                        this.username = username;
-                    else
-                        this.username = string.Empty;
+                    _username = username.Length > 0 ? username : string.Empty;
 
-                    if (password.Length > 0)
-                        this.password = password;
-                    else
-                        this.password = string.Empty;
+                    _password = password.Length > 0 ? password : string.Empty;
 
                     QsysCoreManager.AddCore(this);
 
-                    if (debug == 1)
-                        ErrorLog.Notice("QsysProcessor is initializing.");
+                    if (_debug > 1)
+                        ErrorLog.Notice("QsysProcessor is initializing");
 
-                    if (useExternalConnection == 0)
+                    if (_externalConnection)
                     {
-                        client = new TCPClientDevice();
-
-                        client.Debug = debug;
-
-                        client.ID = id;
-                        client.ConnectionStatus += new StatusEventHandler(client_ConnectionStatus);
-                        client.ResponseString += new ResponseEventHandler(client_ResponseString);
-                        client.Connect(host, port);
+                        _primaryCoreActive = true;
+                        if (OnPrimaryIsActive != null)
+                            OnPrimaryIsActive();
+                        return;
                     }
+
+                    _primaryClient = new TCPClientDevice {Debug = _debug, ID = id + "-primary"};
+                    _backupClient = new TCPClientDevice {Debug = _debug, ID = id + "-backup"};
+
+                    _primaryClient.ConnectionStatus += primaryClient_ConnectionStatus;
+                    _primaryClient.ResponseString += primaryClient_ResponseString;
+                    _backupClient.ConnectionStatus += backupClient_ConnectionStatus;
+                    _backupClient.ResponseString += backupClient_ResponseString;
+                    _primaryClient.Connect(primaryHost, port);
+                    if(backupHost != string.Empty)
+                        _backupClient.Connect(backupHost, port);
                 }
                 catch (Exception e)
                 {
-                    if (debug > 0)
+                    if (_debug > 0)
                         ErrorLog.Error("Error in QsysProcessor Iniitialize: {0}", e.Message);
                 }
             }
         }
 
+        private void AddComponentToChangeGroup(NamedComponent component)
+        {
+            if (!component.Subscribe)
+                return;
+
+            var addComponent = QscQsys.AddComponentToChangeGroup.Instantiate(component.ToComponentSubscribeControls());
+            Enqueue(JsonConvert.SerializeObject(addComponent));
+        }
+
+        private void AddControlToChangeGroup(NamedControl control)
+        {
+            AddControlsToChangeGroup(new[] {control});
+        }
+
+        private void AddControlsToChangeGroup(IEnumerable<NamedControl> controls)
+        {
+            var addControls = QscQsys.AddControlToChangeGroup.Instantiate(controls.Where(c => c.Subscribe).Select(c => c.Name));
+            Enqueue(JsonConvert.SerializeObject(addControls));
+        } 
+
         private void Initialize(object o)
         {
-            lock (Components)
+            lock (_initLock)
             {
-                foreach (var item in Components)
-                {
-                    var addComponent = new AddComoponentToChangeGroup() { method = "ChangeGroup.AddComponentControl", ComponentParams = new AddComponentToChangeGroupParams() { Component = item.Key } };
-                    commandQueue.Enqueue(JsonConvert.SerializeObject(addComponent));
-                    StartAutoPoll();
-                }
-            }
 
-            lock (Controls)
+                if(( _primaryCoreActive && !_primaryIsConnected) || (_backupCoreActive && !_backupIsConnected))
+                    return;
+
+                var components = GetNamedComponents().ToArray();
+                components.ForEach(AddComponentToChangeGroup);
+
+
+                if ((_primaryCoreActive && !_primaryIsConnected) || (_backupCoreActive && !_backupIsConnected))
+                    return;
+
+                var controls = GetNamedControls().ToArray();
+                AddControlsToChangeGroup(controls);
+
+                if ((_primaryCoreActive && !_primaryIsConnected) || (_backupCoreActive && !_backupIsConnected))
+                    return;
+
+                if(components.Any() || controls.Any())
+                    StartAutoPoll();
+
+                _heartbeatTimer.Reset(15000, 15000);
+
+                if (_debug == 1 || _debug == 2)
+                    ErrorLog.Notice("QsysProcessor is initialized.");
+
+                _isInitialized = true;
+
+
+                if (OnIsRegistered != null)
+                    OnIsRegistered(_coreId, 1);
+            }
+        }
+
+        private void ResetInitialization()
+        {
+            lock (_initLock)
             {
-                foreach (var item in Controls)
-                {
-                    var addControl = new AddControlToChangeGroup() { method = "ChangeGroup.AddControl", ControlParams = new AddControlToChangeGroupParams() { Controls = new List<string>() { item.Key.Name } } };
-                    commandQueue.Enqueue(JsonConvert.SerializeObject(addControl));
-                    StartAutoPoll();
-                }
+                _changeGroupCreated = false;
+                _isLoggedIn = false;
+                _isInitialized = false;
+
+                _heartbeatTimer.Stop();
+                _commandQueue.Clear();
+
+                if (OnIsRegistered != null)
+                    OnIsRegistered(_coreId, 0);
+
+                if (OnIsLoggedIn != null)
+                    OnIsLoggedIn(_coreId, 0);
             }
-
-            heartbeatTimer.Reset(15000, 15000);
-
-            if (debug == 1 || debug == 2)
-                ErrorLog.Notice("QsysProcessor is initialized.");
-
-            isInitialized = true;
-
-            if (onIsRegistered != null)
-                onIsRegistered(coreId, 1);
         }
 
         private void StartAutoPoll()
         {
-            if (!changeGroupCreated)
+            if (((_primaryCoreActive && !_primaryIsConnected) || (_backupCoreActive && !_backupIsConnected)) || _changeGroupCreated)
+                return;
+
+            _changeGroupCreated = true;
+            _commandQueue.Enqueue(JsonConvert.SerializeObject(new CreateChangeGroup()));
+        }
+
+        #endregion
+
+        #region Named Components
+
+        public NamedComponent LazyLoadNamedComponent(string name)
+        {
+            NamedComponent component;
+            lock (_components)
             {
-                commandQueue.Enqueue(JsonConvert.SerializeObject(new CreateChangeGroup()));
-                changeGroupCreated = true;
+                
+                if (_components.TryGetValue(name, out component))
+                    return component;
+
+                Action<QsysStateData> updateCallback;
+                component = NamedComponent.Create(name, this, out updateCallback);
+                _components.Add(name, component);
+                _componentUpdateCallbacks.Add(name, updateCallback);
+                
             }
+
+            SubscribeComponent(component);
+            AddComponentToChangeGroup(component);
+
+            return component;
+        }
+
+        public bool TryGetNamedComponent(string name, out NamedComponent component)
+        {
+            lock (_components)
+            {
+                return _components.TryGetValue(name, out component);
+            }
+        }
+
+        private bool TryGetNamedComponentUpdateCallback(string name, out Action<QsysStateData> updateCallback)
+        {
+            lock (_components)
+            {
+                return _componentUpdateCallbacks.TryGetValue(name, out updateCallback);
+            }
+        }
+
+        public IEnumerable<NamedComponent> GetNamedComponents()
+        {
+            lock (_components)
+            {
+                return _components.Values.ToArray();
+            }
+        }
+
+        #endregion
+
+        #region Named Component Callbacks
+
+        private void SubscribeComponent(NamedComponent component)
+        {
+            if (component == null)
+                return;
+
+            component.OnComponentControlAdded += ComponentOnComponentControlAdded;
+            component.OnComponentSubscribeChanged += ComponentOnComponentSubscribeChanged;
+        }
+
+        private void UnsubscribeComponent(NamedComponent component)
+        {
+            if (component == null)
+                return;
+
+            component.OnComponentControlAdded -= ComponentOnComponentControlAdded;
+            component.OnComponentSubscribeChanged -= ComponentOnComponentSubscribeChanged;
+        }
+
+        private void ComponentOnComponentControlAdded(object sender, ComponentControlEventArgs args)
+        {
+            if (IsInitialized && args.Control.Subscribe)
+                AddComponentToChangeGroup(args.Control.Component);
+        }
+
+        private void ComponentOnComponentSubscribeChanged(object sender, ComponentControlSubscribeEventArgs args)
+        {
+            if (args.Subscribe)
+                AddComponentToChangeGroup(args.Control.Component);
+        }
+
+        #endregion
+
+        #region Named Controls
+
+        public NamedControl LazyLoadNamedControl(string name)
+        {
+            return LazyLoadNamedControl(name, true);
+        }
+
+        public NamedControl LazyLoadNamedControl(string name, bool subscribe)
+        {
+            NamedControl control;
+            lock (_controls)
+            {
+                if (_controls.TryGetValue(name, out control))
+                {
+                    // Set subscribe on existing controls (if needed)
+                    if (subscribe)
+                        control.SetSubscribe();
+                    return control;
+                }
+
+                Action<QsysStateData> updateCallback;
+                control = NamedControl.Create(name, this, subscribe, out updateCallback);
+                _controls.Add(name, control);
+                _controlUpdateCallbacks.Add(name, updateCallback);
+            }
+
+            SubscribeControl(control);
+            if (subscribe)
+                AddControlToChangeGroup(control);
+            return control;
+        }
+
+        public bool TryGetNamedControl(string name, out NamedControl control)
+        {
+            lock (_controls)
+            {
+                return _controls.TryGetValue(name, out control);
+            }
+        }
+
+        private bool TryGetNamedControlUpdateCallback(string name, out Action<QsysStateData> updateCallback)
+        {
+            lock (_controls)
+            {
+                return _controlUpdateCallbacks.TryGetValue(name, out updateCallback);
+            }
+        }
+
+        public IEnumerable<NamedControl> GetNamedControls()
+        {
+            lock (_controls)
+            {
+                return _controls.Values.ToArray();
+            }
+        }
+
+        #endregion
+
+        #region NamedControlCallbacks
+
+        private void SubscribeControl(NamedControl control)
+        {
+            if (control == null)
+                return;
+
+            control.OnSubscribeChanged += ControlOnSubscribeChanged;
+        }
+
+        private void UnsubscribeControl(NamedControl control)
+        {
+            if (control == null)
+                return;
+
+            control.OnSubscribeChanged -= ControlOnSubscribeChanged;
+        }
+
+        private void ControlOnSubscribeChanged(object sender, BoolEventArgs args)
+        {
+            if (!args.Data)
+                return;
+
+            var control = sender as NamedControl;
+            if (control != null)
+                AddControlToChangeGroup(control);
         }
 
         #endregion
 
         #region TCP Client Events
-        private void client_ResponseString(string response, SimplSharpString id)
+        private void primaryClient_ResponseString(string response, SimplSharpString id)
         {
-            //responseQueue.Enqueue(response);
-            ProcessResponse(response);
+            lock (_primaryParseLock)
+            {
+                _primaryRxData.Append(response);
+            }
+
+            if (!CMonitor.TryEnter(_primaryResponseLock)) return;
+            while (_primaryRxData.ToString().Contains("\x00"))
+            {
+                string responseData;
+
+                lock (_primaryParseLock)
+                {
+                    responseData = _primaryRxData.ToString();
+                    var delimeterPos = responseData.IndexOf("\x00", StringComparison.Ordinal);
+                    responseData = responseData.Substring(0, delimeterPos);
+                    _primaryRxData.Remove(0, delimeterPos + 1);
+                }
+
+                if (_debug == 2)
+                    CrestronConsole.PrintLine("Primary response found ** {0} **", responseData);
+
+                ParseInternalResponse(true, responseData);
+            }
+
+            CMonitor.Exit(_primaryResponseLock);
         }
 
-        private void client_ConnectionStatus(int status, SimplSharpString id)
+        private void backupClient_ResponseString(string response, SimplSharpString id)
+        {
+            lock (_backupParseLock)
+            {
+                _backupRxData.Append(response);
+            }
+
+            if (!CMonitor.TryEnter(_backupResponseLock)) return;
+            while (_backupRxData.ToString().Contains("\x00"))
+            {
+                string responseData;
+
+                lock (_backupParseLock)
+                {
+                    responseData = _backupRxData.ToString();
+                    var delimeterPos = responseData.IndexOf("\x00", StringComparison.Ordinal);
+                    responseData = responseData.Substring(0, delimeterPos);
+                    _backupRxData.Remove(0, delimeterPos + 1);
+                }
+
+                if (_debug == 2)
+                    CrestronConsole.PrintLine("Backup response found ** {0} **", responseData);
+
+                ParseInternalResponse(false, responseData);
+            }
+
+            CMonitor.Exit(_backupResponseLock);
+        }
+
+        private void primaryClient_ConnectionStatus(int status, SimplSharpString id)
         {
             try
             {
-                if (status == 2 && !IsConnected)
+                _connectionCritical.Enter();
+                if (status == 2 && !_primaryIsConnected)
                 {
-                    IsConnected = true;
+                    _primaryIsConnected = true;
 
-                    if (debug > 0)
-                        ErrorLog.Notice("QsysProcessor is connected.");
+                    if (_debug > 0)
+                        ErrorLog.Notice("QsysProcessor primary is connected.");
 
-                    if (onIsConnected != null)
-                        onIsConnected(coreId,1);
+                    if (OnPrimaryIsConnected != null)
+                        OnPrimaryIsConnected(_coreId, 1);
                 }
-                else if (IsConnected && status != 2)
+                else if (_primaryIsConnected && status != 2)
                 {
-                    IsConnected = false;
+                    _primaryIsConnected = false;
 
-                    if (debug > 0)
-                        ErrorLog.Error("QsysProcessor disconnected!");
+                    if (_debug > 0)
+                        ErrorLog.Error("QsysProcessor primary disconnected!");
 
-                    changeGroupCreated = false;
-                    isLoggedIn = false;
-                    isInitialized = false;
+                    if (_primaryCoreActive) ResetInitialization();
 
-                    heartbeatTimer.Stop();
-
-                    if (onIsRegistered != null)
-                        onIsRegistered(coreId, 0);
-
-                    if (onIsLoggedIn != null)
-                        onIsLoggedIn(coreId, 0);
-
-                    if (onIsConnected != null)
-                        onIsConnected(coreId, 0);
+                    if (OnPrimaryIsConnected != null)
+                        OnPrimaryIsConnected(_coreId, 0);
                 }
             }
             catch (Exception e)
             {
-                if (debug > 0)
-                    ErrorLog.Error("Error in QsysProcessor client_ConnectionStatus: {0}", e.Message);
+                if (_debug > 0)
+                    ErrorLog.Error("Error in QsysProcessor primaryClient_ConnectionStatus: {0}", e.Message);
+            }
+            finally
+            {
+                _connectionCritical.Leave();
+            }
+        }
+
+        private void backupClient_ConnectionStatus(int status, SimplSharpString id)
+        {
+            try
+            {
+                _connectionCritical.Enter();
+                if (status == 2 && !_backupIsConnected)
+                {
+                    _backupIsConnected = true;
+
+                    if (_debug > 0)
+                        ErrorLog.Notice("QsysProcessor backup is connected.");
+
+                    if (OnBackupIsConnected != null)
+                        OnBackupIsConnected(_coreId, 1);
+                }
+                else if (_backupIsConnected && status != 2)
+                {
+                    _backupIsConnected = false;
+
+                    if (_debug > 0)
+                        ErrorLog.Error("QsysProcessor backup disconnected!");
+
+                    if (_backupCoreActive) ResetInitialization();
+
+                    if (OnBackupIsConnected != null)
+                        OnBackupIsConnected(_coreId, 0);
+                }
+            }
+            catch (Exception e)
+            {
+                if (_debug > 0)
+                    ErrorLog.Error("Error in QsysProcessor backupClient_ConnectionStatus: {0}", e.Message);
+            }
+            finally
+            {
+                _connectionCritical.Leave();
             }
         }
 
         private void SendHeartbeat(object o)
         {
-            commandQueue.Enqueue(JsonConvert.SerializeObject(new Heartbeat()));
+            _commandQueue.Enqueue(JsonConvert.SerializeObject(new Heartbeat()));
         }
         #endregion
 
         #region Parsing
-        /*private void ResponseQueueDequeue(object o)
+        private void ParseInternalResponse(bool primaryCore, string returnString)
         {
             try
             {
-                if (!responseQueue.IsEmpty)
+                if (returnString.Length <= 0) return;
+
+                if (returnString.Contains("Changes") && !returnString.Contains("\"Changes\":[]"))
                 {
-                    // removes string from queue, blocks until an item is queued
-                    string tmpString = responseQueue.Dequeue();
+                    var response = JObject.Parse(returnString);
+                    var changes = response["params"]["Changes"].Children().ToList();
 
-                    lock (parseLock)
+                    foreach (var change in changes)
                     {
-                        RxData.Append(tmpString); //Append received data to the COM buffer
-                    }
+                        var changeResult = JsonConvert.DeserializeObject<ChangeResult>(change.ToString(),
+                            new JsonSerializerSettings
+                            { MissingMemberHandling = MissingMemberHandling.Ignore });
 
-                    if (CMonitor.TryEnter(responseLock))
-                    {
-                        while (RxData.ToString().Contains("\x00"))
+                        if (changeResult.Component != null)
                         {
-                            var responseData = string.Empty;
+                            var choices = changeResult.Choices != null ? changeResult.Choices.ToList() : new List<string>();
 
-                            lock (parseLock)
-                            {
-                                responseData = RxData.ToString();
-                                var delimeterPos = responseData.IndexOf("\x00");
-                                responseData = responseData.Substring(0, delimeterPos);
-                                RxData.Remove(0, delimeterPos + 1);
-                            }
+                            Action<QsysStateData> updateCallback;
+                            if (!TryGetNamedComponentUpdateCallback(changeResult.Component, out updateCallback))
+                                continue;
 
-                            if (debug == 2)
-                                CrestronConsole.PrintLine("Response found ** {0} **", responseData);
-                            
-                            new CTimer(ParseInternalResponse, responseData, 0);
+                            updateCallback(new QsysStateData("change", changeResult.Name,
+                                changeResult.Value,
+                                changeResult.Position,
+                                changeResult.String, choices));
                         }
-                        CMonitor.Exit(responseLock);
+                        else if (changeResult.Name != null)
+                        {
+                            List<string> choices = changeResult.Choices != null ? changeResult.Choices.ToList() : new List<string>();
+
+                            Action<QsysStateData> controlUpdateCallback;
+                            if (!TryGetNamedControlUpdateCallback(changeResult.Name, out controlUpdateCallback))
+                                continue;
+
+                            controlUpdateCallback(new QsysStateData("change", changeResult.Name,
+                                changeResult.Value,
+                                changeResult.Position,
+                                changeResult.String, choices));
+                        }
                     }
                 }
-            }
-            catch (Exception e)
-            {
-                CMonitor.Exit(responseLock);
-
-                if (debug == 1 || debug == 2)
-                    ErrorLog.Error("Error in QsysProcessor ResponseQueueDequeue: {0}", e.Message);
-            }
-        }*/
-
-        private void ProcessResponse(string response)
-        {
-            lock (parseLock)
-            {
-                RxData.Append(response); //Append received data to the COM buffer
-            }
-
-            if (CMonitor.TryEnter(responseLock))
-            {
-                while (RxData.ToString().Contains("\x00"))
+                else if (returnString.Contains("EngineStatus"))
                 {
-                    var responseData = string.Empty;
+                    var response = JObject.Parse(returnString);
 
-                    lock (parseLock)
+                    if (_externalConnection)
                     {
-                        responseData = RxData.ToString();
-                        var delimeterPos = responseData.IndexOf("\x00");
-                        responseData = responseData.Substring(0, delimeterPos);
-                        RxData.Remove(0, delimeterPos + 1);
+                        _isLoggedIn = false;
                     }
-
-                    if (debug == 2)
-                        CrestronConsole.PrintLine("Response found ** {0} **", responseData);
-
-                    new CTimer(ParseInternalResponse, responseData, 0);
-                }
-
-                CMonitor.Exit(responseLock);
-            }
-        }
-
-        private void ParseInternalResponse(object o)
-        {
-            try
-            {
-                var returnString = o as string;
-
-                if (returnString != null)
-                {
-                    if (returnString.Length > 0 && ((IsConnected && !externalConnection) || externalConnection))
+                    if (response["params"] != null)
                     {
-                        if (returnString == "{\"jsonrpc\":\"2.0\",\"result\":true,\"id\":\"crestron\"}")
+                        var engineStatus = response["params"];
+
+                        if (engineStatus["State"] != null)
                         {
-                            if (!isLoggedIn)
+                            if (primaryCore && engineStatus["State"].ToObject<string>() == "Active")
                             {
-                                isLoggedIn = true;
-
-                                if (onIsLoggedIn != null)
+                                if (_backupCoreActive)
                                 {
-                                    onIsLoggedIn(coreId, 1);
+
+                                    _backupCoreActive = false;
+                                    ResetInitialization();
                                 }
-
-
-                                waitForConnection.Reset(5000);
+                                _primaryCoreActive = true;
+                                if (OnPrimaryIsActive != null)
+                                    OnPrimaryIsActive();
+                            }
+                            else if (!primaryCore && engineStatus["State"].ToObject<string>() == "Active")
+                            {
+                                if (_primaryCoreActive)
+                                {
+                                    _primaryCoreActive = false;
+                                    ResetInitialization();
+                                }
+                                _backupCoreActive = true;
+                                if (OnBackupIsActive != null)
+                                    OnBackupIsActive();
                             }
                         }
-                        else
+
+                        if ((primaryCore && _primaryCoreActive) || (!primaryCore && _backupCoreActive))
                         {
-                            if (returnString.Contains("Changes") && !returnString.Contains("\"Changes\":[]"))
+
+                            if (engineStatus["DesignName"] != null)
                             {
-                                var response = JObject.Parse(returnString);
-                                IList<JToken> changes = response["params"]["Changes"].Children().ToList();
-                                response = null;
-
-                                IList<ChangeResult> changeResults = new List<ChangeResult>();
-
-                                foreach (JToken change in changes)
-                                {
-                                    ChangeResult changeResult = JsonConvert.DeserializeObject<ChangeResult>(change.ToString(), new JsonSerializerSettings { MissingMemberHandling = MissingMemberHandling.Ignore });
-
-                                    if (changeResult.Component != null)
-                                    {
-                                        foreach (var item in Components)
-                                        {
-                                            List<string> choices;
-
-                                            if (changeResult.Choices != null)
-                                                choices = changeResult.Choices.ToList();
-                                            else
-                                                choices = new List<string>();
-
-                                            if (item.Key.Name == changeResult.Component)
-                                                item.Value.Fire(new QsysInternalEventsArgs(changeResult.Name, changeResult.Value, changeResult.Position, changeResult.String, choices));
-                                        }
-                                    }
-                                    else if (changeResult.Name != null)
-                                    {
-                                        List<string> choices;
-
-                                        if (changeResult.Choices != null)
-                                            choices = changeResult.Choices.ToList();
-                                        else
-                                            choices = new List<string>();
-
-                                        foreach (var item in Controls)
-                                        {
-                                            if (item.Key.Name == changeResult.Name)
-                                                item.Value.Fire(new QsysInternalEventsArgs(changeResult.Name, changeResult.Value, changeResult.Position, changeResult.String, choices));
-                                        }
-                                    }
-                                }
+                                _designName = engineStatus["DesignName"].ToString();
                             }
-                            else if (returnString.Contains("EngineStatus"))
+
+                            if (engineStatus["IsRedundant"] != null)
                             {
-                                var response = JObject.Parse(returnString);
-
-                                if (externalConnection)
-                                {
-                                    isLoggedIn = false;
-                                }
-                                if (response["params"] != null)
-                                {
-                                    JToken engineStatus = response["params"];
-
-                                    if (engineStatus["DesignName"] != null)
-                                    {
-                                        designName = engineStatus["DesignName"].ToString();
-                                    }
-
-                                    if (engineStatus["IsRedundant"] != null)
-                                    {
-                                        isRedundant = Convert.ToBoolean(engineStatus["IsRedundant"].ToString());
-                                    }
-
-                                    if (engineStatus["IsEmulator"] != null)
-                                    {
-                                        isEmulator = Convert.ToBoolean(engineStatus["IsEmulator"].ToString());
-                                    }
-
-                                    if (onNewCoreStatus != null)
-                                        onNewCoreStatus(coreId, designName, Convert.ToUInt16(isRedundant), Convert.ToUInt16(isEmulator));
-                                }
-
-                                if (!isLoggedIn)
-                                {
-                                    if (debug == 1 || debug == 2)
-                                        ErrorLog.Notice("QsysProcessor server ready, starting to send intialization strings.");
-
-                                    if (password.Length > 0 && username.Length > 0)
-                                    {
-                                        logonAttempts = 1;
-                                        commandQueue.Enqueue(JsonConvert.SerializeObject(new Logon() { Params = new LogonParams() { User = username, Password = password } }));
-                                    }
-                                    else
-                                    {
-                                        isLoggedIn = true;
-
-                                        if (onIsLoggedIn != null)
-                                        {
-                                            onIsLoggedIn(coreId, 1);
-                                        }
-
-                                        waitForConnection = new CTimer(Initialize, 5000);
-                                    }
-                                }
+                                _isRedundant = Convert.ToBoolean(engineStatus["IsRedundant"].ToString());
                             }
-                            else if (returnString.Contains("error"))
+
+                            if (engineStatus["IsEmulator"] != null)
                             {
-                                var response = JObject.Parse(returnString);
-
-                                if (logonAttempts < maxLogonAttempts)
-                                {
-                                    JToken error = response["error"];
-
-                                    if (error["code"] != null)
-                                    {
-                                        if (error["code"].ToString().Replace("\'", string.Empty) == "10")
-                                        {
-                                            logonAttempts++;
-                                            commandQueue.Enqueue(JsonConvert.SerializeObject(new Logon() { Params = new LogonParams() { User = username, Password = password } }));
-                                        }
-                                    }
-                                }
-                                else
-                                {
-                                    if (debug > 0)
-                                    {
-                                        ErrorLog.Error("Error in QsysProcessor max logon attempts reached");
-                                    }
-                                }
+                                _isEmulator = Convert.ToBoolean(engineStatus["IsEmulator"].ToString());
                             }
+
+                            if (OnNewCoreStatus != null)
+                                OnNewCoreStatus(_coreId, _designName, Convert.ToUInt16(_isRedundant), Convert.ToUInt16(_isEmulator));
+                        }
+                    }
+
+                    if (!_isLoggedIn)
+                    {
+                        if (_debug == 1 || _debug == 2)
+                            ErrorLog.Notice("QsysProcessor server ready, starting to send intialization strings.");
+
+                        if (_password.Length > 0 && _username.Length > 0)
+                        {
+                            _logonAttempts = 1;
+                            _commandQueue.Enqueue(JsonConvert.SerializeObject(new Logon { Params = new LogonParams { User = _username, Password = _password } }));
+                        }
+                        else if((primaryCore && _primaryCoreActive) || (!primaryCore && _backupCoreActive))
+                        {
+                            _isLoggedIn = true;
+
+                            if (OnIsLoggedIn != null)
+                            {
+                                OnIsLoggedIn(_coreId, 1);
+                            }
+
+                            _waitForConnection.Reset(5000);
+                        }
+                    }
+                }
+                else if (returnString.Contains("error"))
+                {
+                    var response = JObject.Parse(returnString);
+
+                    if (_logonAttempts < _maxLogonAttempts)
+                    {
+                        var error = response["error"];
+
+                        if (error["code"] != null)
+                        {
+                            if (error["code"].ToString().Replace("\'", string.Empty) == "10")
+                            {
+                                _logonAttempts++;
+                                _commandQueue.Enqueue(JsonConvert.SerializeObject(new Logon { Params = new LogonParams { User = _username, Password = _password } }));
+                            }
+                        }
+                    }
+                    else
+                    {
+                        if (_debug > 0)
+                        {
+                            ErrorLog.Error("Error in QsysProcessor max logon attempts reached");
+                        }
+                    }
+                }
+                else if (returnString.Contains("\"id\":") && returnString.Contains("\"result\":true"))
+                {
+                    var response = JObject.Parse(returnString);
+
+                    if (response["id"] != null)
+                    {
+                        var responseData = JsonConvert.DeserializeObject<CustomResponseId>(response["id"].ToObject<string>());
+
+                        if (responseData.Method == "Logon")
+                        {
+                            _isLoggedIn = true;
+
+                            if (OnIsLoggedIn != null)
+                            {
+                                OnIsLoggedIn(_coreId, 1);
+                            }
+
+                            _waitForConnection.Reset(5000);
+                        }
+
+                        if (responseData.Caller != string.Empty)
+                        {
+                            Action<QsysStateData> updateCallback;
+                            if (!TryGetNamedComponentUpdateCallback(responseData.Caller, out updateCallback))
+                                return;
+
+                            updateCallback(new QsysStateData(responseData.ValueType,
+                                responseData.Method,
+                                responseData.Value,
+                                responseData.Position,
+                                responseData.StringValue,
+                                null));
                         }
                     }
                 }
             }
             catch (Exception e)
             {
-                if (debug > 0)
+                if (_debug > 0)
                     ErrorLog.Error("Error in QsysProcessor ParseInternalResponse: {0}", e.Message);
             }
         }
@@ -599,8 +993,8 @@ namespace QscQsys
         /// <param name="response">Response from SIMPL to be parsed</param>
         public void NewExternalResponse(string response)
         {
-            //responseQueue.Enqueue(response);
-            ProcessResponse(response);
+            ParseInternalResponse(true, response);
+            //ProcessResponse(true, response);
         }
         #endregion
 
@@ -608,49 +1002,71 @@ namespace QscQsys
         internal void Enqueue(string data)
         {
             if (data.Length > 0)
-                commandQueue.Enqueue(data);
+                _commandQueue.Enqueue(data);
         }
 
         private void CommandQueueDequeue(object o)
         {
+            var externalSendCallback = OnSendingCommand;
+
+            if (!_externalConnection)
+            {
+                if (_primaryCoreActive && _primaryClient == null)
+                    return;
+
+                if (_backupCoreActive && _backupClient == null)
+                    return;
+            }
+            if (_externalConnection && externalSendCallback == null)
+                return;
+            if (_commandQueue.IsEmpty)
+                return;
+
             try
             {
-                if (!commandQueue.IsEmpty)
+                var data = _commandQueue.TryToDequeue();
+
+                if (data == null)
+                    return;
+
+                if (_debug == 2)
+                    CrestronConsole.PrintLine("Command sent -->{0}<--", data);
+
+                if (!_externalConnection)
                 {
-                    var data = commandQueue.TryToDequeue();
-
-                    if (data != null)
+                    if (data.Contains("NoOp"))
                     {
-                        if (debug == 2)
-                        {
-                            CrestronConsole.PrintLine("Command sent -->{0}<--", data);
-                        }
+                        _primaryClient.SendCommand(data + "\x00");
+                        _backupClient.SendCommand(data + "\x00");
+                    }
+                    else if (_primaryCoreActive)
+                    {
+                        _primaryClient.SendCommand(data + "\x00");
+                    }
+                    else if (_backupCoreActive)
+                    {
+                        _backupClient.SendCommand(data + "\x00");
+                    }
+                }
+                else
+                {
+                    data = data + "\x00";
+                    var xs = data.Chunk(200);
 
-                        if (!externalConnection)
-                            client.SendCommand(data + "\x00");
-                        //else if (SendingCommandEvent != null)
-                        //    SendingCommandEvent(this, new SendingCommandEventArgs(data + "\x00"));
-                        else if (onSendingCommand != null)
-                        {
-                            data = data + "\x00";
-                            var xs = data.Chunk(200);
-
-                            foreach (var x in xs)
-                            {
-                                if (debug == 2)
-                                    CrestronConsole.PrintLine("Command chuck sent externally length={0} -->{1}<--", x.Length, x);
-                                onSendingCommand(coreId, x);
-                            }
-                        }
+                    foreach (var x in xs)
+                    {
+                        if (_debug == 2)
+                            CrestronConsole.PrintLine("Command chuck sent externally length={0} -->{1}<--", x.Length, x);
+                        externalSendCallback(_coreId, x);
                     }
                 }
             }
             catch (Exception e)
             {
-                if (debug > 0)
-                    ErrorLog.Error("Error in QsysProcessor CommandQueueDequeue: {0}", e.Message);
+                if (_debug > 0)
+                    ErrorLog.Exception(string.Format("Error in QsysProcessor CommandQueueDequeue: {0}", e.Message), e);
 
-                commandQueue.Clear();
+                _commandQueue.Clear();
             }
         }
         #endregion
@@ -661,38 +1077,29 @@ namespace QscQsys
         public void Dispose()
         {
             Dispose(true);
-            isDisposed = true;
         }
 
         private void Dispose(bool disposing)
         {
-            if (!isDisposed)
+            if (_disposed) return;
+
+            _disposed = true;
+            if (disposing)
             {
-                if (disposing)
-                {
-                    changeGroupCreated = false;
-                    isLoggedIn = false;
-                    isInitialized = false;
+                _changeGroupCreated = false;
+                _isLoggedIn = false;
+                _isInitialized = false;
 
-                    waitForConnection.Stop();
-                    waitForConnection.Dispose();
+                _waitForConnection.Dispose();
+                _heartbeatTimer.Dispose();
+                _commandQueueTimer.Dispose();
+                _commandQueue.Dispose();
 
-                    heartbeatTimer.Stop();
-                    heartbeatTimer.Dispose();
+                _primaryClient.Dispose();
+                _backupClient.Dispose();              
 
-                    commandQueueTimer.Stop();
-                    commandQueueTimer.Dispose();
-                    commandQueue.Dispose();
-
-                    RxData.Remove(0, RxData.Length);
-
-                    maxLogonAttempts = 2;
-                    debug = 0;
-                }
-
-                client.Disconnect();
-                client.ConnectionStatus -= client_ConnectionStatus;
-                client.ResponseString -= client_ResponseString;
+                _primaryRxData = null;
+                _backupRxData = null;
             }
         }
     }

@@ -2,168 +2,227 @@
 #SYMBOL_NAME "Qsys Fader"
 
 #USER_SIMPLSHARP_LIBRARY "QscQsys"
+#ENABLE_TRACE
+
+#DEFINE_CONSTANT true 1
+#DEFINE_CONSTANT false 0
+
+
 
 Digital_Input MuteOn, MuteOff, MuteToggle, VolumeUp, VolumeDown;
-Analog_Input Volume;
+Analog_Input Volume, VolumeDB;
 
 Digital_Output MuteIsOn, MuteIsOff;
 String_Output _skip_, _skip_, VolumeValue;
 Analog_Output VolumePrecentage;
 
-                                                    
-QsysFader fader;
-
-String_Parameter _skip_,_skip_,_skip_,_skip_,_skip_,_skip_, CoreID[100], ComponentName[100];                                       
+String_Parameter _skip_,_skip_,_skip_,_skip_,_skip_,_skip_, _skip_, CoreID[100], ComponentName[100];                                       
 
 Integer_Parameter VolumeStep, VolumeRepeatTime, VolumeHoldTillRepeatTime;
 
 #BEGIN_PARAMETER_PROPERTIES VolumeRepeatTime
-    propValidUnits = unitTime;
+propValidUnits = unitTime;
 #END_PARAMETER_PROPERTIES
 
 #BEGIN_PARAMETER_PROPERTIES CoreID
-   propValidUnits = unitString;
-   propDefaultUnit = unitString;
-   propDefaultValue = "1";
+propValidUnits = unitString;
+propDefaultUnit = unitString;
+propDefaultValue = "1";
 #END_PARAMETER_PROPERTIES
 
-
+QsysFader fader;
 integer currentVolume;
-integer newDirection;
+signed_integer volDb;
+integer volDbSemephore;
+CMutex _volRampMutex;
+integer _volRampDirection;
 
-function VolumeRepeat(integer direction)
+function VolumeRepeat()
 {
-	newDirection = direction;
-
-    if(newDirection = 1 && currentVolume <= 65535 - VolumeStep)
-    	fader.Volume(currentVolume + VolumeStep);
-    else if(newDirection = 1 && currentVolume > 65535 - VolumeStep)
-        fader.Volume(65535);
-	else if(newDirection = 0 && currentVolume >= 0 + VolumeStep)
-		fader.Volume(currentVolume - VolumeStep);
-    else if(newDirection = 0 && currentVolume < 0 + VolumeStep)
-        fader.Volume(0);
-
-    wait(VolumeRepeatTime, vRepeat)
-    {
-        VolumeRepeat(newDirection);
-    }
+	if(_volRampDirection = 0)
+	{
+		return;
+	}
+	else{
+		if(_volRampDirection = 1)
+		{
+			if(currentVolume <= 65535 - VolumeStep)
+			fader.Volume(currentVolume + VolumeStep);
+			else if(_volRampDirection = 1 && currentVolume > 65535 - VolumeStep)
+			fader.Volume(65535);
+		}
+		else if(_volRampDirection = 2)
+		{
+			if(currentVolume >= 0 + VolumeStep)
+			fader.Volume(currentVolume - VolumeStep);
+			else if(currentVolume < 0 + VolumeStep)
+			fader.Volume(0);
+		}
+		
+		if(_volRampDirection > 0)
+		{
+			wait(VolumeRepeatTime, vRepeat)
+			{
+				VolumeRepeat();
+			}
+		}
+	}
 }
 
-function VolumeSet(integer direction)
+function VolumeSet()
 {
-    newDirection = direction;
-
-    if(newDirection = 1 && currentVolume <= 65535 - VolumeStep)
-    	fader.Volume(currentVolume + VolumeStep);
-    else if(newDirection = 1 && currentVolume > 65535 - VolumeStep)
-        fader.Volume(65535);
-	else if(newDirection = 0 && currentVolume >= 0 + VolumeStep)
-		fader.Volume(currentVolume - VolumeStep);
-    else if(newDirection = 0 && currentVolume < 0 + VolumeStep)
-        fader.Volume(0);
-
-        wait(VolumeHoldTillRepeatTime, vHold)
-    {
-        VolumeRepeat(newDirection);
-    }
+	if(_volRampDirection = 0)
+	{
+		return;
+	}
+	else 
+	{
+		if(_volRampDirection = 1)
+		{
+			if(currentVolume <= 65535 - VolumeStep)
+			fader.Volume(currentVolume + VolumeStep);
+			else if(currentVolume > 65535 - VolumeStep)
+			fader.Volume(65535);
+		}
+		else if(_volRampDirection = 2)
+		{
+			if(currentVolume >= 0 + VolumeStep)
+			fader.Volume(currentVolume - VolumeStep);
+			else if(currentVolume < 0 + VolumeStep)
+			fader.Volume(0);
+		}
+		
+		if(_volRampDirection > 0)
+		{
+			wait(VolumeHoldTillRepeatTime, vHold)
+			{
+				VolumeRepeat();
+			}
+		}
+	}
 }
 
 Push MuteOn
 {
-    fader.Mute(1);
+	fader.Mute(true);
 }
 
 Push MuteOff
 {
-    fader.Mute(0);
+	fader.Mute(false);
 }
 
 Push MuteToggle
 {
-    if(!MuteIsOn && MuteIsOff)
-    {
-        fader.Mute(1);
-    }
-    else if (MuteIsOn && !MuteIsOff)
-    {
-        fader.Mute(0);
-    }
+	if(MuteIsOn)
+	{
+		fader.Mute(false);
+	}
+	else
+	{
+		fader.Mute(true);
+	}
 }
 
 Push VolumeUp
 {
-    VolumeSet(1);
+	_volRampMutex.WaitForMutex();
+	_volRampDirection = 1;
+	VolumeSet();
+	_volRampMutex.ReleaseMutex();
 }
 
 Release VolumeUp
 {
-    CancelWait(vHold);
-    CancelWait(vRepeat);
+	_volRampMutex.WaitForMutex();
+	_volRampDirection = 0;
+	CancelWait(vHold);
+	CancelWait(vRepeat);
+	_volRampMutex.ReleaseMutex();
 }
 
 Push VolumeDown
 {
-    VolumeSet(0);
+	_volRampMutex.WaitForMutex();
+	_volRampDirection = 2;
+	VolumeSet();
+	_volRampMutex.ReleaseMutex();
 }
 
 Release VolumeDown
 {
-    CancelWait(vHold);
-    CancelWait(vRepeat);
+	_volRampMutex.WaitForMutex();
+	_volRampDirection = 0;
+	CancelWait(vHold);
+	CancelWait(vRepeat);
+	_volRampMutex.ReleaseMutex();
 }
 
 Threadsafe Change Volume
 {
-    integer x;
+	integer x;
+	
+	if(Volume = 0)
+	{
+		fader.Volume(0);
+	}
+	else 
+	{
+		While(x != Volume)
+		{
+			x = Volume;
+			fader.Volume(x);
+		}
+	}
+}
 
-    if(Volume = 0)
-    {
-        fader.Volume(0);
-    }
-    else 
-    {
-        While(x != volume)
-        {
-            x = Volume;
-            fader.Volume(x);
-        }
-    }
+Change VolumeDB
+{
+	signed_integer x;
+	volDb = VolumeDB;
+	
+	if(volDbSemephore)
+	{
+		volDbSemephore = false;
+		if(volDB = 0)
+		{
+			x = volDb;
+			fader.Decibels(x);
+		}
+		while(x != volDb)
+		{
+			x = volDb;
+			fader.Decibels(x);
+		}
+		
+		volDbSemephore = true;
+	}
 }
 
 Callback Function onVolumeChange(string cName, integer value)
 {
-    currentVolume = value;
-    VolumePrecentage = currentVolume;
+	currentVolume = value;
+	VolumePrecentage = currentVolume;
 }
 
 Callback Function onMuteChange(string cName, integer value)
 {
-    switch(value)
-    {
-       case (1):
-       {
-           MuteIsOff = OFF;
-           MuteIsOn = ON;
-       }
-       case (0):
-       {
-           MuteIsOff = ON;
-           MuteIsOn = OFF;
-       }
-    }
+	MuteIsOn = value;
+	MuteIsOff = !value;
 }
 
 callback function onGainStringChange(string cName, string value)
 {
-    VolumeValue = value;
+	VolumeValue = value;
 }
 
 Function Main()
 {              
-    RegisterDelegate(fader, newVolumeChange, onVolumeChange);
-    RegisterDelegate(fader, newMuteChange, onMuteChange); 
-    RegisterDelegate(fader, newGainStringChange, onGainStringChange);
-    fader.Initialize(CoreID, ComponentName);                                  
-
+	RegisterDelegate(fader, newVolumeChange, onVolumeChange);
+	RegisterDelegate(fader, newMuteChange, onMuteChange); 
+	RegisterDelegate(fader, newGainStringChange, onGainStringChange);
+	fader.Initialize(CoreID, ComponentName);                                  
+	
+	volDbSemephore = true;
+	_volRampDirection = 0;
 }
